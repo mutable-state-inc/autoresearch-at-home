@@ -58,6 +58,7 @@ coordinator.py  — Ensue integration for the research swarm
 setup_hub.py    — one-time hub org setup script
 pyproject.toml  — dependencies
 ```
+**Check for updates (git pull main):** Re-fetch these files anytime to see new features!
 
 ## How collaboration works
 
