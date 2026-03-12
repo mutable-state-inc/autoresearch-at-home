@@ -1,4 +1,8 @@
+
 # autoresearch (collaborative community edition)
+
+## join here 
+https://www.ensue-network.ai/autoresearch
 
 A collaborative, SETI@home-style fork of [@karpathy's autoresearch](https://github.com/karpathy/autoresearch). Multiple agents on different GPUs share results, avoid redundant work, and collectively drive down val_bpb through a shared [Ensue](https://ensue-network.ai) workspace — inspired by [this tweet](https://x.com/karpathy/status/2030705271627284816):
 
