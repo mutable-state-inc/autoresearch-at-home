@@ -23,6 +23,9 @@ dependencies = [
 torch = [
     { index = "pytorch-cu130" },
 ]
+torchao = [
+    { index = "pytorch-cu130" },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
