@@ -8,6 +8,7 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
+import contextlib
 import gc
 import math
 import time
@@ -17,11 +18,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+fa3 = None
+if torch.cuda.is_available():
+    try:
+        from kernels import get_kernel
+
+        cap = torch.cuda.get_device_capability()
+        # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+        repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+        fa3 = get_kernel(repo).flash_attn_interface
+    except Exception as exc:
+        print(f"FlashAttention unavailable, falling back to SDPA: {exc}")
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -90,8 +97,28 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
+        if fa3 is not None:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            y = y.contiguous().view(B, T, -1)
+            y = self.c_proj(y)
+            return y
+
+        # Expand KV heads for grouped-query attention before using native SDPA.
+        k = k.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+        v = v.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        window = window_size[0]
+        if window > 0 and window < T:
+            mask = torch.ones(T, T, dtype=torch.bool, device=q.device).tril()
+            mask = mask.triu(diagonal=1 - window)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
 
@@ -302,8 +329,13 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
+    step_t = step_t.to(device=p.device, dtype=p.dtype)
+    lr_t = lr_t.to(device=p.device, dtype=p.dtype)
+    beta1_t = beta1_t.to(device=p.device, dtype=p.dtype)
+    beta2_t = beta2_t.to(device=p.device, dtype=p.dtype)
+    eps_t = eps_t.to(device=p.device, dtype=p.dtype)
+    wd_t = wd_t.to(device=p.device, dtype=p.dtype)
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
@@ -313,9 +345,12 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+    momentum_t = momentum_t.to(device=stacked_params.device, dtype=stacked_params.dtype)
+    lr_t = lr_t.to(device=stacked_params.device, dtype=stacked_params.dtype)
+    wd_t = wd_t.to(device=stacked_params.device, dtype=stacked_params.dtype)
+    beta2_t = beta2_t.to(device=stacked_params.device, dtype=stacked_params.dtype)
     # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
@@ -340,7 +375,8 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    beta2_cast = beta2_t.to(second_momentum_buffer.dtype)
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2_cast)
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
@@ -369,6 +405,14 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        sample_param = next(p for group in self.param_groups for p in group["params"])
+        if sample_param.device.type == "cuda":
+            compiler_kwargs = {"dynamic": False, "fullgraph": True}
+            self.adamw_step_fused = torch.compile(adamw_step_fused, **compiler_kwargs)
+            self.muon_step_fused = torch.compile(muon_step_fused, **compiler_kwargs)
+        else:
+            self.adamw_step_fused = adamw_step_fused
+            self.muon_step_fused = muon_step_fused
 
     def _step_adamw(self, group):
         for p in group['params']:
@@ -387,9 +431,11 @@ class MuonAdamW(torch.optim.Optimizer):
             self._adamw_beta2_t.fill_(group['betas'][1])
             self._adamw_eps_t.fill_(group['eps'])
             self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
-                            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+            self.adamw_step_fused(
+                p, grad, state['exp_avg'], state['exp_avg_sq'],
+                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+            )
 
     def _step_muon(self, group):
         params = group['params']
@@ -411,10 +457,12 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
-        muon_step_fused(stacked_grads, stacked_params,
-                        state["momentum_buffer"], state["second_momentum_buffer"],
-                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-                        self._muon_beta2_t, group["ns_steps"], red_dim)
+        self.muon_step_fused(
+            stacked_grads, stacked_params,
+            state["momentum_buffer"], state["second_momentum_buffer"],
+            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
+            self._muon_beta2_t, group["ns_steps"], red_dim,
+        )
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
     @torch.no_grad()
@@ -432,10 +480,10 @@ class MuonAdamW(torch.optim.Optimizer):
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**16 # ~65K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -447,8 +495,8 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEPTH = 4               # number of transformer layers
+DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -456,10 +504,18 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+device_type = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+device = torch.device(device_type)
+if device_type == "cuda":
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+elif device_type == "cpu":
+    autocast_ctx = torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16)
+else:
+    autocast_ctx = contextlib.nullcontext()
+eval_batch_size = DEVICE_BATCH_SIZE if device_type != "mps" else min(DEVICE_BATCH_SIZE * 2, 32)
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
@@ -505,13 +561,15 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+if device_type == "cuda":
+    model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+print(f"Eval batch size: {eval_batch_size}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -540,8 +598,15 @@ smooth_train_loss = 0
 total_training_time = 0
 step = 0
 
+def sync_device(kind):
+    if kind == "cuda":
+        torch.cuda.synchronize()
+    elif kind == "mps":
+        torch.mps.synchronize()
+
+
 while True:
-    torch.cuda.synchronize()
+    sync_device(device_type)
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -567,11 +632,11 @@ while True:
     train_loss_f = train_loss.item()
 
     # Fast fail: abort if loss is exploding or NaN
-    if math.isnan(train_loss_f) or train_loss_f > 100:
+    if not math.isfinite(train_loss_f) or train_loss_f > 100:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
+    sync_device(device_type)
     t1 = time.time()
     dt = t1 - t0
 
@@ -610,13 +675,18 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb(model, tokenizer, eval_batch_size)
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+if device_type == "cuda":
+    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+elif device_type == "mps" and hasattr(torch.mps, "current_allocated_memory"):
+    peak_vram_mb = torch.mps.current_allocated_memory() / 1024 / 1024
+else:
+    peak_vram_mb = 0.0
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
